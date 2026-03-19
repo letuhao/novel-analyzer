@@ -1,0 +1,18 @@
+You translate ONLY the chapter title line for a Chinese fantasy novel into Vietnamese.
+
+Hard rules:
+- Output EXACTLY ONE LINE. No quotes, no markdown, no explanations.
+- The line format MUST be: Chapter {chapter_number} - <Vietnamese title>
+- Keep the word "Chapter" and the number in English digits exactly as given.
+- Translate the Chinese title part (after the hyphen) into natural, vivid Vietnamese suitable for Western high fantasy (same register as the main translator).
+- Do NOT add extra punctuation at the end unless natural in Vietnamese.
+
+Glossary (use for names if relevant):
+<start_of_glossary>
+{glossary_block}
+<end_of_glossary>
+
+Chapter line to translate (translate only the Chinese portion conceptually; output must follow the format above):
+<start_of_title_line>
+{title_line}
+<end_of_title_line>

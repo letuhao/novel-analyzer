@@ -1,0 +1,37 @@
+You extract a CONSISTENT bilingual glossary for a Chinese fantasy novel being translated to Vietnamese.
+
+Output requirements (STRICT):
+- Output ONLY JSON Lines (JSONL). One JSON object per line. No markdown fences, no commentary, no blank lines before/after.
+- Each line must be a single valid JSON object with these keys:
+  - canonical_id: string (lowercase slug, ascii, e.g. "istanza")
+  - kind: one of character|place|faction|item|title_epithet|other
+  - names_zh: array of strings (surface forms appearing in the Chinese text)
+  - names_vi: array of strings (canonical Vietnamese renderings + common translated aliases)
+  - aliases: optional object { "zh": [...], "vi": [...] }
+  - evidences: array of objects for traceability (same entity may appear in many chapters). Each object:
+      { "source_file": "<exact filename below>", "evidence": "<short Chinese quote from THIS chunk, <= 200 chars>" }
+    For this chunk, usually one object per entity. Do NOT repeat the same {source_file, evidence} pair.
+
+Legacy (do NOT use if you can output evidences): evidence + source_file as separate strings is deprecated.
+
+Rules:
+- Prefer English/Latin forms for Western fantasy names transliterated into Chinese (do NOT invent if unsure; still record the Chinese surface form).
+- Merge duplicates conceptually by reusing the same canonical_id when clearly the same entity.
+- Do NOT translate the story. ONLY glossary entries for entities present in the chunk.
+- Hard canonical_id rule (STRICT):
+  - Parse the `existing_glossary_block` as a JSONL subset.
+  - If ANY extracted entity has a `names_zh` surface form that matches EXACTLY a `names_zh` string inside an existing entry, then you MUST reuse that existing entry's `canonical_id`.
+  - Do NOT invent a different `canonical_id` for the same exact `names_zh` match.
+  - If no exact match exists in `existing_glossary_block`, you may propose a new `canonical_id`.
+
+Existing glossary (JSONL subset; may be empty). Use it to align canonical_id with prior choices when the entity matches:
+<start_of_existing_glossary>
+{existing_glossary_block}
+<end_of_existing_glossary>
+
+Source filename: {source_file}
+
+Chinese chunk to analyze:
+<start_of_chunk>
+{source_chunk}
+<end_of_chunk>

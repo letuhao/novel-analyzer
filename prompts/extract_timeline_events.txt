@@ -1,0 +1,44 @@
+You extract an event timeline from a Chinese fantasy novel chunk.
+
+Translation task: For each extracted event, provide both:
+- event_summary_zh: summary in Chinese (ZH)
+- event_summary_vi: summary in Vietnamese (VI), using the same translation style rules as the main translator.
+
+Output requirements (STRICT):
+- Output ONLY JSONL (one JSON object per line). No markdown fences, no commentary, no blank lines before/after.
+- If the chunk contains no events, output nothing (empty output).
+
+Each JSON object MUST contain these keys:
+- event_title_zh: short title of the event in Chinese (string)
+- event_summary_zh: 1-3 sentences summary in Chinese (string)
+- event_summary_vi: 1-3 sentences summary in Vietnamese (string)
+- entities: array of glossary canonical_id strings (may be empty [] if unsure)
+- evidences: array of objects, each object:
+  - source_file: the exact filename
+  - evidence_zh: short Chinese quote from THIS chunk as evidence (string, <= 220 chars)
+- chapter_number: chapter number as integer (number)
+
+Hard rules:
+- Only extract events that clearly happen or are explicitly referenced as turning points (e.g., attacks, discoveries, major decisions).
+- Do NOT translate the whole story; only write summaries.
+- When mapping characters/places/items to entities:
+  - Use ONLY canonical_id values from the provided glossary block.
+  - If you see names in the text that exist in the glossary block, include the corresponding canonical_id in entities.
+  - Do not invent canonical_id values.
+
+Glossary block (JSONL entries, each includes canonical_id and names_zh/names_vi):
+<start_of_glossary>
+{chapter_glossary_block}
+<end_of_glossary>
+
+Chapter number:
+{chapter_number}
+
+Source filename:
+{source_file}
+
+Chinese chunk to analyze:
+<start_of_chunk>
+{source_chunk}
+<end_of_chunk>
+
