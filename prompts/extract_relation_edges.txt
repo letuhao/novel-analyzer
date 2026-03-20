@@ -11,7 +11,11 @@ Each JSON line MUST be exactly:
   "relation_type": "<string>",
   "target_entity": "<canonical_id>",
   "evidences": [
-    { "source_file": "<filename>", "evidence_zh": "<short Chinese quote>" }
+    {
+      "source_file": "<filename>",
+      "evidence_zh": "<short Chinese quote from the chunk>",
+      "evidence_vi": "<Vietnamese translation of that quote, concise, same register as the novel VI translation>"
+    }
   ]
 }
 
@@ -19,7 +23,7 @@ Hard rules:
 - source_entity and target_entity MUST be chosen ONLY from the provided glossary block canonical_id values.
 - relation_type must be a short standardized label (choose from):
   ally_of | enemy_of | mentor_of | subordinate_of | follows | opposes | targets | collaborates_with | owes | located_in | belongs_to_faction | other
-- evidences must be direct quotes from the chunk and evidence_zh length <= 220 chars.
+- Each evidence object MUST include BOTH `evidence_zh` (direct quote, <= 220 Chinese chars) AND `evidence_vi` (faithful, compact Vietnamese for RAG). Use glossary `names_vi` for entities when they appear in the quote.
 - Prefer high-confidence edges only. If multiple possible mappings exist, use fewer edges.
 
 Glossary block (JSONL entries):

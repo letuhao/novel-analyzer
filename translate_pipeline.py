@@ -48,12 +48,31 @@ def read_text(path: Path) -> str:
 
 
 def split_header_body(text: str) -> tuple[str, str]:
+    """
+    Legacy split: first line vs rest. Prefer using chapter_header_line() + full file text for pipeline passes.
+    """
     lines = text.splitlines()
     if not lines:
         return "", ""
     if lines[0].strip().startswith("Chapter "):
         return lines[0], "\n".join(lines[1:]).lstrip("\n")
     return "", text
+
+
+def chapter_header_line(text: str) -> str:
+    """First line when it matches add_chapter_metadata format (Chapter N - …). Used only for chapter_number / metadata."""
+    lines = text.splitlines()
+    if lines and lines[0].strip().startswith("Chapter "):
+        return lines[0]
+    return ""
+
+
+def body_after_chapter_header_line(text: str) -> str:
+    """Everything after the first line (for --no-translate-header: do not send line 1 to translate)."""
+    lines = text.splitlines()
+    if len(lines) <= 1:
+        return ""
+    return "\n".join(lines[1:]).lstrip("\n")
 
 
 # Metadata line from add_chapter_metadata.py: "Chapter 123 - 正文 ..."
@@ -74,6 +93,26 @@ def parse_chapter_header_line(header: str) -> tuple[str, str] | None:
         return None
     title_rest = _strip_sourcefile_suffix_from_title(m.group(2).strip())
     return m.group(1), title_rest
+
+
+def ensure_vi_chapter_keeps_sourcefile_suffix(zh_chapter: str, vi_chapter: str) -> str:
+    """
+    add_chapter_metadata.py appends '| SourceFile: …' on the ZH header line.
+    When the title is translated inside the main chunk (no dedicated header call), the model may drop it;
+    copy the suffix from ZH line 1 onto VI line 1 if missing.
+    """
+    z_lines = zh_chapter.splitlines()
+    v_lines = vi_chapter.splitlines()
+    if not z_lines or not v_lines:
+        return vi_chapter
+    m = re.search(r"(\|\s*SourceFile:\s*.+)$", z_lines[0].strip(), flags=re.IGNORECASE)
+    if not m:
+        return vi_chapter
+    suffix = m.group(1).strip()
+    if re.search(r"\|\s*SourceFile:\s*", v_lines[0], flags=re.IGNORECASE):
+        return vi_chapter
+    v_lines[0] = f"{v_lines[0].rstrip()} {suffix}".rstrip()
+    return "\n".join(v_lines)
 
 
 def build_line_chunks(text: str, max_chunk_chars: int) -> list[str]:
@@ -111,8 +150,85 @@ def strip_markdown_fences(s: str) -> str:
     return s.strip()
 
 
+# Common "thinking" / reasoning wrappers leaked into message content by some local servers.
+_LLM_THINKING_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"<\s*think\s*>[\s\S]*?</\s*think\s*>", re.IGNORECASE),
+    re.compile(r"<\s*redacted_reasoning\s*>[\s\S]*?</\s*redacted_reasoning\s*>", re.IGNORECASE),
+    re.compile(r"<thinking>[\s\S]*?</thinking>", re.IGNORECASE),
+    re.compile(r"<reasoning>[\s\S]*?</reasoning>", re.IGNORECASE),
+    re.compile(r"```(?:think|thinking|reasoning)[\s\S]*?```", re.IGNORECASE),
+)
+
+
+def sanitize_llm_text_for_parse(content: str) -> str:
+    """
+    Strip thinking/reasoning blocks and trim whitespace before JSONL or PASS/FIXED_VI parsing.
+    Does not guarantee valid JSON; see parse_jsonl_objects for recovery heuristics.
+    """
+    s = content or ""
+    for pat in _LLM_THINKING_PATTERNS:
+        s = pat.sub("", s)
+    return s.strip()
+
+
+def extract_json_dicts_balanced(text: str) -> list[dict]:
+    """
+    Find top-level {...} spans (string-aware) and json.loads each dict.
+    Fallback when the model mixes prose with JSON or uses multi-line objects without JSONL newlines.
+    """
+    out: list[dict] = []
+    s = text or ""
+    i = 0
+    n = len(s)
+    while i < n:
+        j = s.find("{", i)
+        if j < 0:
+            break
+        depth = 0
+        start = j
+        k = j
+        in_str = False
+        esc = False
+        quote = ""
+        while k < n:
+            ch = s[k]
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == quote:
+                    in_str = False
+                k += 1
+                continue
+            if ch in ('"', "'"):
+                in_str = True
+                quote = ch
+                k += 1
+                continue
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    chunk = s[start : k + 1]
+                    try:
+                        obj = json.loads(chunk)
+                    except json.JSONDecodeError:
+                        i = j + 1
+                        break
+                    if isinstance(obj, dict):
+                        out.append(obj)
+                    i = k + 1
+                    break
+            k += 1
+        else:
+            i = j + 1
+    return out
+
+
 def parse_jsonl_objects(content: str) -> list[dict]:
-    content = strip_markdown_fences(content)
+    content = sanitize_llm_text_for_parse(strip_markdown_fences(content))
     out: list[dict] = []
     for raw_line in content.splitlines():
         line = raw_line.strip()
@@ -124,6 +240,8 @@ def parse_jsonl_objects(content: str) -> list[dict]:
             continue
         if isinstance(obj, dict):
             out.append(obj)
+    if not out:
+        out = extract_json_dicts_balanced(content)
     return out
 
 
@@ -582,15 +700,28 @@ class BudgetConfig:
     context_tokens: int = 13000
     safety_tokens: int = 400
     completion_translate: int = 4500
+    completion_translate_title: int = 256
     completion_extract: int = 1800
     completion_validate: int = 3200
     completion_timeline: int = 2500
     completion_facts: int = 2300
     completion_relations: int = 2300
     completion_scenes: int = 2300
+    completion_cjk_fix: int = 1536
     glossary_inject_tokens: int = 1200
     glossary_max_entries: int = 40
     existing_glossary_cap_tokens: int = 900
+    # Title-line translate: glossary snippet + completion budget
+    title_glossary_inject_cap: int = 800
+    title_glossary_max_entries: int = 20
+    # Caps on chapter glossary rows (min with glossary_max_entries in code)
+    glossary_merge_max_entries: int = 25
+    glossary_timeline_max_entries: int = 40
+    glossary_metadata_max_entries: int = 45
+    # Upper bounds on Chinese body chars per metadata chunk (after budget-derived cap)
+    metadata_facts_chunk_max_chars: int = 6000
+    metadata_relations_chunk_max_chars: int = 7000
+    metadata_scenes_chunk_max_chars: int = 7000
 
 
 def fill_template(tpl: str, **kwargs: str) -> str:
@@ -603,17 +734,71 @@ def fill_template(tpl: str, **kwargs: str) -> str:
     return out
 
 
+# CJK Unified Ideographs (basic leak detection for Vietnamese output)
+_CJK_RE = re.compile(r"[\u4e00-\u9fff]")
+
+
+def vi_line_contains_cjk(s: str) -> bool:
+    return bool(_CJK_RE.search(s or ""))
+
+
+def cjk_leak_bad_line_indices(zh_lines: list[str], vi_lines: list[str]) -> tuple[list[int], bool]:
+    """
+    Returns (bad_indices, line_count_mismatch).
+    bad_indices: 0-based lines in vi that still contain CJK when a vi line exists.
+    """
+    mismatch = len(zh_lines) != len(vi_lines)
+    bad: list[int] = []
+    n = min(len(zh_lines), len(vi_lines))
+    for i in range(n):
+        if vi_line_contains_cjk(vi_lines[i]):
+            bad.append(i)
+    for i in range(n, len(vi_lines)):
+        if vi_line_contains_cjk(vi_lines[i]):
+            bad.append(i)
+    return bad, mismatch
+
+
+def apply_cjk_fix_objects_to_vi_lines(
+    vi_lines: list[str],
+    objs: list[dict],
+    allowed_indices: set[int],
+) -> int:
+    """Apply JSONL fix objects {"line": int, "vi": str}. Extends vi_lines if needed. Returns count applied."""
+    applied = 0
+    for o in objs:
+        if not isinstance(o, dict):
+            continue
+        try:
+            li = int(o.get("line", -1))
+        except (TypeError, ValueError):
+            continue
+        if li not in allowed_indices:
+            continue
+        vi = o.get("vi")
+        if not isinstance(vi, str):
+            continue
+        while len(vi_lines) <= li:
+            vi_lines.append("")
+        vi_lines[li] = vi.strip()
+        applied += 1
+    return applied
+
+
 def parse_validate_response(validator_output: str, vi_original: str) -> tuple[str, bool]:
-    t = strip_markdown_fences(validator_output).strip()
+    t = sanitize_llm_text_for_parse(strip_markdown_fences(validator_output))
     if not t:
         return vi_original, False
-    first = t.splitlines()[0].strip().strip("*`").strip()
-    if first == "PASS":
-        return vi_original, True
-    if first == "FIXED_VI":
-        rest = t.split("\n", 1)
-        fixed = rest[1] if len(rest) > 1 else ""
-        return fixed.strip(), True
+    lines = t.splitlines()
+    for idx, raw in enumerate(lines):
+        first = raw.strip().strip("*`").strip()
+        if not first:
+            continue
+        if first == "PASS":
+            return vi_original, True
+        if first == "FIXED_VI":
+            fixed = "\n".join(lines[idx + 1 :])
+            return fixed.strip(), True
     return vi_original, False
 
 
@@ -750,8 +935,10 @@ class TimelineStore:
 
 
 def _dedupe_evidence_pairs(evidences: list[dict], evidence_field: str = "evidence_zh") -> list[dict]:
-    seen: set[tuple[str, str]] = set()
-    out: list[dict] = []
+    """
+    Dedupe by (source_file, primary evidence text). Preserve extra fields (e.g. evidence_vi).
+    """
+    merged_by_key: dict[tuple[str, str], dict] = {}
     for rec in evidences:
         if not isinstance(rec, dict):
             continue
@@ -760,19 +947,41 @@ def _dedupe_evidence_pairs(evidences: list[dict], evidence_field: str = "evidenc
         if not sf or not ev:
             continue
         key = (sf, ev)
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append({"source_file": sf, evidence_field: ev})
-    return out
+        if key not in merged_by_key:
+            row = {k: v for k, v in rec.items()}
+            row["source_file"] = sf
+            row[evidence_field] = ev
+            merged_by_key[key] = row
+        else:
+            acc = merged_by_key[key]
+            for k, v in rec.items():
+                if k in ("source_file", evidence_field, "evidence"):
+                    continue
+                if v is None:
+                    continue
+                if not str(v).strip():
+                    continue
+                prev = acc.get(k)
+                if prev is None or (isinstance(prev, str) and not prev.strip()):
+                    acc[k] = v
+    return list(merged_by_key.values())
+
+
+def _facts_payload_for_dedupe_hash(facts: dict) -> dict:
+    """
+    Strip *_vi sibling keys so fact_id stays stable when Vietnamese is present or added later.
+    """
+    if not isinstance(facts, dict):
+        return {}
+    return {k: v for k, v in facts.items() if isinstance(k, str) and not k.endswith("_vi")}
 
 
 def compute_entity_fact_id(chapter_number: int, entity_id: str, facts: dict) -> tuple[str, str]:
     """
     Returns (fact_id, fact_key) deterministic for dedupe.
     """
-    # fact_key is a hash of the facts payload.
-    facts_obj = facts if isinstance(facts, dict) else {}
+    # fact_key is a hash of the facts payload (ZH / non-_vi keys only).
+    facts_obj = _facts_payload_for_dedupe_hash(facts if isinstance(facts, dict) else {})
     fact_key = hashlib.sha1(json.dumps(facts_obj, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
     base = f"{chapter_number}|{entity_id}|{fact_key}"
     fact_id = hashlib.sha1(base.encode("utf-8")).hexdigest()
@@ -841,9 +1050,10 @@ class EntityFactsStore:
             # keep facts if richer
             old_facts = old.get("facts", {})
             if isinstance(old_facts, dict) and isinstance(facts, dict):
-                # Add missing keys from new.
+                # Add missing keys from new (including *_vi when older row had only ZH).
                 for k, v in facts.items():
-                    if k not in old_facts or not old_facts.get(k):
+                    prev = old_facts.get(k)
+                    if k not in old_facts or prev is None or (isinstance(prev, str) and not str(prev).strip()):
                         old_facts[k] = v
                 old["facts"] = old_facts
             self.facts_by_id[fid] = old
@@ -1082,6 +1292,11 @@ class Pipeline:
         relation_edges_path: Path | None = None,
         scenes_enabled: bool = True,
         scenes_path: Path | None = None,
+        translate_prompt_path: Path | None = None,
+        translate_cjk_validate_enabled: bool = False,
+        cjk_validate_retries: int = 3,
+        cjk_retry_prompt_path: Path | None = None,
+        validate_retry_whole_chunk: bool = True,
     ) -> None:
         self.root = root
         self.client = client
@@ -1090,16 +1305,22 @@ class Pipeline:
         self.glossary_path = glossary_path
         self.dry_run = dry_run
         self.validate_enabled = validate_enabled
+        self.validate_retry_whole_chunk = validate_retry_whole_chunk
         self.translate_header = translate_header
+        self.translate_cjk_validate_enabled = translate_cjk_validate_enabled
+        self.cjk_validate_retries = max(0, int(cjk_validate_retries))
 
         self.prompt_extract = (prompts_dir / "extract_glossary.txt").read_text(encoding="utf-8")
-        self.prompt_translate = (prompts_dir / "translate.txt").read_text(encoding="utf-8")
+        tp = translate_prompt_path or (prompts_dir / "translate.txt")
+        self.prompt_translate = tp.read_text(encoding="utf-8")
         self.prompt_validate = (prompts_dir / "validate.txt").read_text(encoding="utf-8")
         self.prompt_translate_title = (prompts_dir / "translate_title.txt").read_text(encoding="utf-8")
         self.prompt_timeline = (prompts_dir / "extract_timeline_events.txt").read_text(encoding="utf-8")
         self.prompt_facts = (prompts_dir / "extract_entity_facts.txt").read_text(encoding="utf-8")
         self.prompt_relations = (prompts_dir / "extract_relation_edges.txt").read_text(encoding="utf-8")
         self.prompt_scenes = (prompts_dir / "extract_scene_segments.txt").read_text(encoding="utf-8")
+        crp = cjk_retry_prompt_path or (prompts_dir / "translate_retry_cjk_leak.txt")
+        self.prompt_cjk_retry = crp.read_text(encoding="utf-8")
 
         self.timeline_enabled = timeline_enabled
         self.timeline_path = timeline_path
@@ -1129,63 +1350,79 @@ class Pipeline:
             "content": "You follow instructions exactly. Never add markdown fences unless explicitly requested.",
         }
 
-    def _translate_chapter_header_line(
-        self, header: str, glossary: dict[str, dict], log
+    def run_cjk_line_fix_loop(
+        self,
+        zh_text: str,
+        vi_text: str,
+        glossary_block: str,
+        log,
+        *,
+        chunk_index: int,
+        stage: str = "translate_chunk_cjk",
     ) -> str:
         """
-        Translate the metadata line `Chapter N - <ZH title>` in one dedicated LLM call.
-        Body text is never mixed in — that is why the title was left ZH when this was off.
+        Rule-based CJK leak detection per line; up to cjk_validate_retries LLM calls
+        that only receive the bad (zh, vi) pairs. Does not re-translate the whole chunk.
         """
-        parsed = parse_chapter_header_line(header)
-        if not parsed:
-            h_user = fill_template(
-                self.prompt_translate,
-                glossary_block="(none)",
-                user_input=header,
-            )
-            hmsgs = [self._system_msg(), {"role": "user", "content": h_user}]
-            out = self.client.chat(hmsgs, max_tokens=256, temperature=0.2).content.strip()
-            log({"stage": "translate_header", "mode": "fallback_full_line"})
-            return out or header
-
-        _num, zh_rest = parsed
-        # Avoid polluting glossary selection with "SourceFile" suffix.
-        key_text = zh_rest
-
-        m_sf = re.search(r"\|\s*SourceFile:\s*(.+)$", (header or "").strip(), flags=re.IGNORECASE)
-        source_file = m_sf.group(1).strip() if m_sf else None
-        gloss_block = select_relevant_glossary(
-            glossary,
-            key_text,
-            max_tokens=min(800, self.budget.glossary_inject_tokens),
-            max_entries=min(20, self.budget.glossary_max_entries),
-        )
-        title_only_line = f"Chapter {_num} - {zh_rest}"
-        h_user = fill_template(
-            self.prompt_translate_title,
-            glossary_block=gloss_block or "(none)",
-            chapter_number=_num,
-            title_line=title_only_line.strip(),
-        )
-        hmsgs = [self._system_msg(), {"role": "user", "content": h_user}]
-        out = self.client.chat(hmsgs, max_tokens=256, temperature=0.2).content.strip()
-        if not out:
-            log({"stage": "translate_header", "warn": "empty response"})
-            return header
-        out = out.splitlines()[0].strip().strip("`").strip()
-        if not out.lower().startswith("chapter "):
+        if not self.translate_cjk_validate_enabled or self.dry_run:
+            return vi_text
+        zh_lines = zh_text.splitlines()
+        vi_lines = vi_text.splitlines()
+        bad, mismatch = cjk_leak_bad_line_indices(zh_lines, vi_lines)
+        if mismatch:
             log(
                 {
-                    "stage": "translate_header",
-                    "warn": "missing Chapter prefix; keeping original",
-                    "raw": out[:240],
+                    "stage": stage,
+                    "chunk_index": chunk_index,
+                    "line_count_mismatch": True,
+                    "zh_line_count": len(zh_lines),
+                    "vi_line_count": len(vi_lines),
                 }
             )
-            return header
-        log({"stage": "translate_header", "mode": "translate_title_prompt"})
-        if source_file:
-            out = out + f" | SourceFile: {source_file}"
-        return out
+        attempt = 0
+        while bad and attempt < self.cjk_validate_retries:
+            attempt += 1
+            allowed = set(bad)
+            pairs: list[dict] = []
+            for i in sorted(bad):
+                zhi = zh_lines[i] if i < len(zh_lines) else ""
+                vii = vi_lines[i] if i < len(vi_lines) else ""
+                pairs.append({"line": i, "zh": zhi, "vi": vii})
+            bad_jsonl = "\n".join(json.dumps(p, ensure_ascii=False) for p in pairs)
+            user = fill_template(
+                self.prompt_cjk_retry,
+                glossary_block=glossary_block or "(none)",
+                bad_lines_jsonl=bad_jsonl,
+            )
+            msgs = [self._system_msg(), {"role": "user", "content": user}]
+            res = self.client.chat(
+                msgs, max_tokens=self.budget.completion_cjk_fix, temperature=0.05
+            ).content
+            objs = parse_jsonl_objects(res)
+            applied = apply_cjk_fix_objects_to_vi_lines(vi_lines, objs, allowed)
+            bad_after, _ = cjk_leak_bad_line_indices(zh_lines, vi_lines)
+            log(
+                {
+                    "stage": stage,
+                    "chunk_index": chunk_index,
+                    "cjk_retry_attempt": attempt,
+                    "bad_line_count_before": len(bad),
+                    "fix_objects_applied": applied,
+                    "bad_line_count_after": len(bad_after),
+                }
+            )
+            bad = bad_after
+        if bad:
+            log(
+                {
+                    "stage": stage,
+                    "chunk_index": chunk_index,
+                    "warn": "cjk_leak_unresolved",
+                    "remaining_bad_lines": bad[:24],
+                    "remaining_bad_count": len(bad),
+                }
+            )
+        return "\n".join(vi_lines)
 
     def compute_chunk_limits(self) -> tuple[int, int, int]:
         """
@@ -1236,11 +1473,11 @@ class Pipeline:
 
         return max_chars_extract, max_chars_translate, max_chars_validate_pair
 
-    def run_glossary_pass(self, source_file: str, body: str, log) -> None:
+    def run_glossary_pass(self, source_file: str, chapter_text: str, log) -> None:
         glossary = load_glossary(self.glossary_path)
         name_to_best_cid = build_name_to_best_cid(glossary)
         max_ce, _, _ = self.compute_chunk_limits()
-        chunks = build_line_chunks(body, max_ce)
+        chunks = build_line_chunks(chapter_text, max_ce)
         log({"stage": "glossary", "chunks": len(chunks), "max_chars": max_ce})
         if self.dry_run:
             return
@@ -1250,9 +1487,9 @@ class Pipeline:
         pinned = ["伊斯坦莎", "勇者", "魔王"]
         existing_glossary_block = build_chapter_glossary_block(
             glossary,
-            body,
+            chapter_text,
             max_tokens=self.budget.existing_glossary_cap_tokens,
-            max_entries=min(self.budget.glossary_max_entries, 25),
+            max_entries=min(self.budget.glossary_max_entries, self.budget.glossary_merge_max_entries),
             pinned_names_zh=pinned,
         )
 
@@ -1269,7 +1506,12 @@ class Pipeline:
             if not objs:
                 append_reject(
                     self.glossary_path.parent / "glossary_rejects.jsonl",
-                    {"source_file": source_file, "chunk_index": idx, "raw": res.content[:4000]},
+                    {
+                        "source_file": source_file,
+                        "chunk_index": idx,
+                        "finish_reason": getattr(res, "finish_reason", None),
+                        "raw": res.content[:4000],
+                    },
                 )
                 continue
             touched: set[str] = set()
@@ -1328,29 +1570,43 @@ class Pipeline:
     def run_translate_pass(
         self,
         source_file: str,
-        header: str,
-        body: str,
+        header_line: str,
+        chapter_text: str,
         log,
     ) -> str:
         glossary = load_glossary(self.glossary_path)
         _, max_ct, _ = self.compute_chunk_limits()
-        chunks = build_line_chunks(body, max_ct)
-        log({"stage": "translate", "chunks": len(chunks), "max_chars": max_ct})
+        # Full chapter text in chunks (title line included in chunk 0) — no separate title LLM call.
+        # With --no-translate-header, only translate body_after_chapter_header_line; keep header_line ZH.
+        if self.translate_header or not header_line:
+            translate_source = chapter_text
+        else:
+            translate_source = body_after_chapter_header_line(chapter_text)
+
+        chunks = build_line_chunks(translate_source, max_ct)
+        log(
+            {
+                "stage": "translate",
+                "chunks": len(chunks),
+                "max_chars": max_ct,
+                "unified_chapter_text": True,
+                "translate_header": self.translate_header,
+            }
+        )
 
         vi_chunks: list[str] = []
 
         if self.dry_run:
-            h = header
-            if self.translate_header and header:
-                h = header + " [dry-run: would translate title]"
-            return (h + "\n\n" if h else "") + "\n\n".join(f"[DRY-RUN]{c[:40]}..." for c in chunks)
+            if self.translate_header or not header_line:
+                return "\n\n".join(f"[DRY-RUN]{c[:40]}..." for c in chunks)
+            return header_line + "\n\n" + "\n\n".join(f"[DRY-RUN]{c[:40]}..." for c in chunks)
 
         # Build a stable mini-glossary for the entire chapter and inject it
         # into every translate/validate call (not per-chunk).
         pinned = ["伊斯坦莎", "勇者", "魔王"]
         chapter_glossary_block = build_chapter_glossary_block(
             glossary,
-            body,
+            chapter_text,
             max_tokens=self.budget.glossary_inject_tokens,
             max_entries=self.budget.glossary_max_entries,
             pinned_names_zh=pinned,
@@ -1365,6 +1621,11 @@ class Pipeline:
             msgs = [self._system_msg(), {"role": "user", "content": user}]
             vi = self.client.chat(msgs, max_tokens=self.budget.completion_translate, temperature=0.25).content.strip()
 
+            # Legacy validate (prompts/validate.txt): sends FULL zh_chunk + FULL vi_chunk every time.
+            # - If model returns PASS: one extra LLM call; VI unchanged.
+            # - If FIXED_VI: same call but model must emit the ENTIRE chunk again (high completion cost).
+            # - If parse fails and validate_retry_whole_chunk: +1 full re-translate + +1 full validate (very expensive).
+            # For line-only fixes and lower cost, use --no-validate and --translate-cjk-validate instead.
             if self.validate_enabled:
                 vb = chapter_glossary_block
 
@@ -1384,7 +1645,7 @@ class Pipeline:
                 vi2, ok = _validate_current(vi)
                 if ok:
                     vi = vi2
-                else:
+                elif self.validate_retry_whole_chunk:
                     # one retry translate with short hint
                     hint = (
                         "Your previous translation failed validation. "
@@ -1396,19 +1657,33 @@ class Pipeline:
                     vi3, ok2 = _validate_current(vi)
                     if ok2:
                         vi = vi3
+                else:
+                    log(
+                        {
+                            "stage": "translate_chunk",
+                            "index": idx,
+                            "warn": "validate_unparsed_or_fail_keep_vi",
+                            "validate_retry_whole_chunk": False,
+                        }
+                    )
+
+            if self.translate_cjk_validate_enabled:
+                vi = self.run_cjk_line_fix_loop(
+                    ch,
+                    vi,
+                    chapter_glossary_block or "(none)",
+                    log,
+                    chunk_index=idx,
+                    stage="translate_chunk_cjk",
+                )
 
             vi_chunks.append(vi)
             log({"stage": "translate_chunk", "index": idx, "vi_chars": len(vi)})
 
-        # Header: not part of body chunks — translate in a dedicated short call (default on).
-        out_header = header
-        if self.translate_header and header:
-            out_header = self._translate_chapter_header_line(header, glossary, log)
-
         body_vi = "\n".join(vi_chunks)
-        if out_header:
-            return out_header + "\n\n" + body_vi
-        return body_vi
+        if not self.translate_header and header_line:
+            return header_line + "\n\n" + body_vi
+        return ensure_vi_chapter_keeps_sourcefile_suffix(chapter_text, body_vi)
 
     def compute_timeline_chunk_max_chars(
         self,
@@ -1432,16 +1707,16 @@ class Pipeline:
             max_chars = min(max_chars, self.timeline_max_chars)
         return max_chars
 
-    def run_timeline_pass(self, source_file: str, header: str, body: str, log) -> None:
+    def run_timeline_pass(self, source_file: str, header_line: str, chapter_text: str, log) -> None:
         if not self.timeline_enabled or not self.timeline_store:
             return
 
-        # Extract chapter number from header: "Chapter N - ..."
-        parsed = parse_chapter_header_line(header)
+        # Extract chapter number from metadata line: "Chapter N - ..."
+        parsed = parse_chapter_header_line(header_line)
         if parsed:
             chapter_number = int(parsed[0])
         else:
-            m = re.search(r"Chapter\s+(\d+)\s*-", header or "")
+            m = re.search(r"Chapter\s+(\d+)\s*-", header_line or "")
             chapter_number = int(m.group(1)) if m else 0
 
         glossary = load_glossary(self.glossary_path)
@@ -1449,9 +1724,9 @@ class Pipeline:
         pinned = ["伊斯坦莎", "勇者", "魔王"]
         chapter_glossary_block = build_chapter_glossary_block(
             glossary,
-            body,
+            chapter_text,
             max_tokens=self.budget.glossary_inject_tokens,
-            max_entries=min(self.budget.glossary_max_entries, 40),
+            max_entries=min(self.budget.glossary_max_entries, self.budget.glossary_timeline_max_entries),
             pinned_names_zh=pinned,
         )
 
@@ -1460,7 +1735,7 @@ class Pipeline:
             chapter_number=chapter_number,
             source_file=source_file,
         )
-        chunks = build_line_chunks(body, max_ct)
+        chunks = build_line_chunks(chapter_text, max_ct)
         log({"stage": "timeline", "chunks": len(chunks), "max_chars": max_ct})
 
         if self.dry_run:
@@ -1512,7 +1787,7 @@ class Pipeline:
         # Flush once per chapter.
         self.timeline_store.flush()
 
-    def run_facts_pass(self, source_file: str, header: str, body: str, log) -> None:
+    def run_facts_pass(self, source_file: str, header_line: str, chapter_text: str, log) -> None:
         # Only run if we have timeline context (entity facts should be extracted after timeline).
         if not self.facts_store:
             return
@@ -1521,11 +1796,11 @@ class Pipeline:
             timeline_events_block = "(none)"
             chapter_number = 0
         else:
-            parsed = parse_chapter_header_line(header)
+            parsed = parse_chapter_header_line(header_line)
             if parsed:
                 chapter_number = int(parsed[0])
             else:
-                m = re.search(r"Chapter\s+(\d+)\s*-", header or "")
+                m = re.search(r"Chapter\s+(\d+)\s*-", header_line or "")
                 chapter_number = int(m.group(1)) if m else 0
 
             # Build a compact timeline block for this chapter to ground facts.
@@ -1549,9 +1824,9 @@ class Pipeline:
         pinned = ["伊斯坦莎", "勇者", "魔王"]
         chapter_glossary_block = build_chapter_glossary_block(
             glossary,
-            body,
+            chapter_text,
             max_tokens=self.budget.glossary_inject_tokens,
-            max_entries=min(self.budget.glossary_max_entries, 45),
+            max_entries=min(self.budget.glossary_max_entries, self.budget.glossary_metadata_max_entries),
             pinned_names_zh=pinned,
         )
 
@@ -1568,9 +1843,9 @@ class Pipeline:
         base_tokens = est_tokens(base_user) + sys_tokens
         avail = self.budget.context_tokens - self.budget.safety_tokens - self.budget.completion_facts - base_tokens
         max_ct = max(256, int(avail * 3))
-        max_ct = min(max_ct, 6000)
+        max_ct = min(max_ct, self.budget.metadata_facts_chunk_max_chars)
 
-        chunks = build_line_chunks(body, max_ct)
+        chunks = build_line_chunks(chapter_text, max_ct)
         log({"stage": "entity_facts", "chunks": len(chunks), "max_chars": max_ct})
 
         if self.dry_run:
@@ -1608,14 +1883,14 @@ class Pipeline:
 
         self.facts_store.flush()
 
-    def run_relations_pass(self, source_file: str, header: str, body: str, log) -> None:
+    def run_relations_pass(self, source_file: str, header_line: str, chapter_text: str, log) -> None:
         glossary = load_glossary(self.glossary_path)
 
-        parsed = parse_chapter_header_line(header)
+        parsed = parse_chapter_header_line(header_line)
         if parsed:
             chapter_number = int(parsed[0])
         else:
-            m = re.search(r"Chapter\s+(\d+)\s*-", header or "")
+            m = re.search(r"Chapter\s+(\d+)\s*-", header_line or "")
             chapter_number = int(m.group(1)) if m else 0
 
         if not self.relations_store:
@@ -1625,9 +1900,9 @@ class Pipeline:
         pinned = ["伊斯坦莎", "勇者", "魔王"]
         chapter_glossary_block = build_chapter_glossary_block(
             glossary,
-            body,
+            chapter_text,
             max_tokens=self.budget.glossary_inject_tokens,
-            max_entries=min(self.budget.glossary_max_entries, 45),
+            max_entries=min(self.budget.glossary_max_entries, self.budget.glossary_metadata_max_entries),
             pinned_names_zh=pinned,
         )
         entities_in_chapter: set[str] = set()
@@ -1692,9 +1967,9 @@ class Pipeline:
         base_tokens = est_tokens(base_user) + sys_tokens
         avail = self.budget.context_tokens - self.budget.safety_tokens - self.budget.completion_relations - base_tokens
         max_ct = max(256, int(avail * 3))
-        max_ct = min(max_ct, 7000)
+        max_ct = min(max_ct, self.budget.metadata_relations_chunk_max_chars)
 
-        chunks = build_line_chunks(body, max_ct)
+        chunks = build_line_chunks(chapter_text, max_ct)
         log({"stage": "relation_edges", "chunks": len(chunks), "max_chars": max_ct})
 
         if self.dry_run:
@@ -1729,14 +2004,14 @@ class Pipeline:
 
         self.relations_store.flush()
 
-    def run_scene_pass(self, source_file: str, header: str, body: str, log) -> None:
+    def run_scene_pass(self, source_file: str, header_line: str, chapter_text: str, log) -> None:
         glossary = load_glossary(self.glossary_path)
 
-        parsed = parse_chapter_header_line(header)
+        parsed = parse_chapter_header_line(header_line)
         if parsed:
             chapter_number = int(parsed[0])
         else:
-            m = re.search(r"Chapter\s+(\d+)\s*-", header or "")
+            m = re.search(r"Chapter\s+(\d+)\s*-", header_line or "")
             chapter_number = int(m.group(1)) if m else 0
 
         if not self.scenes_store:
@@ -1746,9 +2021,9 @@ class Pipeline:
         pinned = ["伊斯坦莎", "勇者", "魔王"]
         chapter_glossary_block = build_chapter_glossary_block(
             glossary,
-            body,
+            chapter_text,
             max_tokens=self.budget.glossary_inject_tokens,
-            max_entries=min(self.budget.glossary_max_entries, 45),
+            max_entries=min(self.budget.glossary_max_entries, self.budget.glossary_metadata_max_entries),
             pinned_names_zh=pinned,
         )
 
@@ -1782,9 +2057,9 @@ class Pipeline:
         base_tokens = est_tokens(base_user) + sys_tokens
         avail = self.budget.context_tokens - self.budget.safety_tokens - self.budget.completion_scenes - base_tokens
         max_ct = max(256, int(avail * 3))
-        max_ct = min(max_ct, 7000)
+        max_ct = min(max_ct, self.budget.metadata_scenes_chunk_max_chars)
 
-        chunks = build_line_chunks(body, max_ct)
+        chunks = build_line_chunks(chapter_text, max_ct)
         log({"stage": "scenes", "chunks": len(chunks), "max_chars": max_ct})
 
         if self.dry_run:
@@ -1820,8 +2095,8 @@ class Pipeline:
         self.scenes_store.flush()
 
     def process_file(self, chapter_path: Path, out_dir: Path, run_log_path: Path | None) -> None:
-        text = read_text(chapter_path)
-        header, body = split_header_body(text)
+        chapter_text = read_text(chapter_path)
+        header_line = chapter_header_line(chapter_text)
         source_file = chapter_path.name
 
         def log(obj: dict) -> None:
@@ -1831,12 +2106,13 @@ class Pipeline:
                 with run_log_path.open("a", encoding="utf-8", newline="\n") as f:
                     f.write(json.dumps(obj, ensure_ascii=False) + "\n")
 
-        self.run_glossary_pass(source_file, body, log)
-        self.run_timeline_pass(source_file, header, body, log)
-        self.run_facts_pass(source_file, header, body, log)
-        self.run_relations_pass(source_file, header, body, log)
-        self.run_scene_pass(source_file, header, body, log)
-        out_text = self.run_translate_pass(source_file, header, body, log)
+        # All extract passes use the full raw file (including Chapter title line) for context.
+        self.run_glossary_pass(source_file, chapter_text, log)
+        self.run_timeline_pass(source_file, header_line, chapter_text, log)
+        self.run_facts_pass(source_file, header_line, chapter_text, log)
+        self.run_relations_pass(source_file, header_line, chapter_text, log)
+        self.run_scene_pass(source_file, header_line, chapter_text, log)
+        out_text = self.run_translate_pass(source_file, header_line, chapter_text, log)
 
         out_path = out_dir / chapter_path.name
         if not self.dry_run:
@@ -1847,6 +2123,24 @@ class Pipeline:
 
 def discover_chapters(chapters_dir: Path) -> list[Path]:
     return sorted(chapters_dir.glob("C*.txt"))
+
+
+def resolve_prompt_file(root: Path, prompts_dir: Path, rel_or_name: str) -> Path:
+    """Paths with a directory separator are resolved under project root; bare names use prompts_dir."""
+    p = Path(rel_or_name)
+    if p.is_absolute():
+        return p
+    s = str(rel_or_name).replace("\\", "/")
+    if "/" in s:
+        return (root / p).resolve()
+    return (prompts_dir / p.name).resolve()
+
+
+def _env_bool(key: str, default: bool) -> bool:
+    v = os.environ.get(key)
+    if v is None:
+        return default
+    return v.strip().lower() not in ("0", "false", "no", "off")
 
 
 def main() -> int:
@@ -1863,15 +2157,58 @@ def main() -> int:
     parser.add_argument("--resume", action="store_true", help="Skip if output file already exists")
     parser.add_argument("--no-validate", action="store_true")
     parser.add_argument(
+        "--validate-retry-whole-chunk",
+        action=argparse.BooleanOptionalAction,
+        default=_env_bool("VALIDATE_RETRY_WHOLE_CHUNK", True),
+        help="If legacy validate fails to return PASS/FIXED_VI, run a second full-chunk translate + validate (expensive). "
+        "Use --no-validate-retry-whole-chunk to skip and keep first VI (then e.g. CJK line-fix only).",
+    )
+    parser.add_argument(
         "--no-translate-header",
         action="store_true",
-        help="Keep the first line (Chapter N - …) unchanged (Chinese title stays)",
+        help="Keep the first line (Chapter N - …) in Chinese; translate the rest only (no separate title LLM call)",
     )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--context-tokens", type=int, default=int(os.environ.get("LLM_CONTEXT_TOKENS", "13000")))
     parser.add_argument("--completion-translate", type=int, default=int(os.environ.get("LLM_COMPLETION_TRANSLATE", "4500")))
+    parser.add_argument(
+        "--completion-translate-title",
+        type=int,
+        default=int(os.environ.get("LLM_COMPLETION_TRANSLATE_TITLE", "256")),
+        help="Max tokens for test harness translate_title prompt only (main pipeline translates title inside normal chunks)",
+    )
     parser.add_argument("--completion-extract", type=int, default=int(os.environ.get("LLM_COMPLETION_EXTRACT", "1800")))
     parser.add_argument("--completion-validate", type=int, default=int(os.environ.get("LLM_COMPLETION_VALIDATE", "3200")))
+    parser.add_argument(
+        "--completion-cjk-fix",
+        type=int,
+        default=int(os.environ.get("LLM_COMPLETION_CJK_FIX", "1536")),
+        help="Max tokens for JSONL line-fix pass (translate-only CJK leak retry)",
+    )
+    parser.add_argument(
+        "--translate-prompt",
+        type=str,
+        default=os.environ.get("TRANSLATE_PROMPT_FILE", "translate.txt"),
+        help="Translate prompt file (name under prompts/ or path under project root)",
+    )
+    parser.add_argument(
+        "--cjk-retry-prompt",
+        type=str,
+        default=os.environ.get("CJK_RETRY_PROMPT_FILE", "translate_retry_cjk_leak.txt"),
+        help="CJK line-fix retry prompt (JSONL output), under prompts/ or project path",
+    )
+    parser.add_argument(
+        "--translate-cjk-validate",
+        action=argparse.BooleanOptionalAction,
+        default=_env_bool("TRANSLATE_CJK_VALIDATE", False),
+        help="After each translate chunk, fix lines that still contain CJK (translate stage only). Enable for Qwen/uncensored models.",
+    )
+    parser.add_argument(
+        "--cjk-validate-retries",
+        type=int,
+        default=int(os.environ.get("CJK_VALIDATE_RETRIES", "3")),
+        help="Max LLM calls per chunk for CJK line-fix (not whole-chunk retranslate)",
+    )
     parser.add_argument(
         "--timeline",
         action=argparse.BooleanOptionalAction,
@@ -1879,10 +2216,93 @@ def main() -> int:
         help="Enable event timeline extraction after glossary extraction",
     )
     parser.add_argument("--timeline-path", type=str, default="timeline/timeline_events.jsonl")
-    parser.add_argument("--timeline-max-chars", type=int, default=9000)
+    parser.add_argument(
+        "--timeline-max-chars",
+        type=int,
+        default=int(os.environ.get("LLM_TIMELINE_MAX_CHARS", os.environ.get("TIMELINE_MAX_CHARS", "9000"))),
+        help="Upper bound on ZH chars per timeline chunk (after context budget)",
+    )
     parser.add_argument("--completion-timeline", type=int, default=int(os.environ.get("LLM_COMPLETION_TIMELINE", "2500")))
+    parser.add_argument(
+        "--completion-facts",
+        type=int,
+        default=int(os.environ.get("LLM_COMPLETION_FACTS", "2300")),
+        help="Max tokens for extract_entity_facts (metadata JSONL)",
+    )
+    parser.add_argument(
+        "--completion-relations",
+        type=int,
+        default=int(os.environ.get("LLM_COMPLETION_RELATIONS", "2300")),
+        help="Max tokens for extract_relation_edges (metadata JSONL)",
+    )
+    parser.add_argument(
+        "--completion-scenes",
+        type=int,
+        default=int(os.environ.get("LLM_COMPLETION_SCENES", "2300")),
+        help="Max tokens for extract_scene_segments (metadata JSONL)",
+    )
     parser.add_argument("--glossary-inject-tokens", type=int, default=int(os.environ.get("GLOSSARY_INJECT_TOKENS", "1200")))
     parser.add_argument("--glossary-max-entries", type=int, default=int(os.environ.get("GLOSSARY_MAX_ENTRIES", "40")))
+    parser.add_argument(
+        "--safety-tokens",
+        type=int,
+        default=int(os.environ.get("LLM_SAFETY_TOKENS", "400")),
+        help="Reserved tokens subtracted from context when sizing chunks",
+    )
+    parser.add_argument(
+        "--existing-glossary-cap-tokens",
+        type=int,
+        default=int(os.environ.get("LLM_EXISTING_GLOSSARY_CAP_TOKENS", "900")),
+        help="Max tokens for merged existing-glossary block in glossary extract",
+    )
+    parser.add_argument(
+        "--title-glossary-inject-cap",
+        type=int,
+        default=int(os.environ.get("LLM_TITLE_GLOSSARY_INJECT_CAP", "800")),
+        help="Cap (with glossary_inject_tokens) for title-line glossary selection",
+    )
+    parser.add_argument(
+        "--title-glossary-max-entries",
+        type=int,
+        default=int(os.environ.get("LLM_TITLE_GLOSSARY_MAX_ENTRIES", "20")),
+        help="Max glossary rows injected for title translation",
+    )
+    parser.add_argument(
+        "--glossary-merge-max-entries",
+        type=int,
+        default=int(os.environ.get("LLM_GLOSSARY_MERGE_MAX_ENTRIES", "25")),
+        help="Max rows when building cross-chunk existing glossary for extract",
+    )
+    parser.add_argument(
+        "--glossary-timeline-max-entries",
+        type=int,
+        default=int(os.environ.get("LLM_GLOSSARY_TIMELINE_MAX_ENTRIES", "40")),
+        help="Max chapter glossary rows for timeline pass",
+    )
+    parser.add_argument(
+        "--glossary-metadata-max-entries",
+        type=int,
+        default=int(os.environ.get("LLM_GLOSSARY_METADATA_MAX_ENTRIES", "45")),
+        help="Max chapter glossary rows for facts/relations/scenes",
+    )
+    parser.add_argument(
+        "--metadata-facts-chunk-max-chars",
+        type=int,
+        default=int(os.environ.get("LLM_METADATA_FACTS_CHUNK_MAX_CHARS", "6000")),
+        help="Upper bound on ZH chars per entity_facts chunk",
+    )
+    parser.add_argument(
+        "--metadata-relations-chunk-max-chars",
+        type=int,
+        default=int(os.environ.get("LLM_METADATA_RELATIONS_CHUNK_MAX_CHARS", "7000")),
+        help="Upper bound on ZH chars per relation_edges chunk",
+    )
+    parser.add_argument(
+        "--metadata-scenes-chunk-max-chars",
+        type=int,
+        default=int(os.environ.get("LLM_METADATA_SCENES_CHUNK_MAX_CHARS", "7000")),
+        help="Upper bound on ZH chars per scenes chunk",
+    )
 
     parser.add_argument(
         "--facts",
@@ -1919,13 +2339,31 @@ def main() -> int:
     client = client_from_env()
     budget = BudgetConfig(
         context_tokens=args.context_tokens,
+        safety_tokens=args.safety_tokens,
         completion_translate=args.completion_translate,
+        completion_translate_title=args.completion_translate_title,
         completion_extract=args.completion_extract,
         completion_validate=args.completion_validate,
         completion_timeline=args.completion_timeline,
+        completion_facts=args.completion_facts,
+        completion_relations=args.completion_relations,
+        completion_scenes=args.completion_scenes,
+        completion_cjk_fix=args.completion_cjk_fix,
         glossary_inject_tokens=args.glossary_inject_tokens,
         glossary_max_entries=args.glossary_max_entries,
+        existing_glossary_cap_tokens=args.existing_glossary_cap_tokens,
+        title_glossary_inject_cap=args.title_glossary_inject_cap,
+        title_glossary_max_entries=args.title_glossary_max_entries,
+        glossary_merge_max_entries=args.glossary_merge_max_entries,
+        glossary_timeline_max_entries=args.glossary_timeline_max_entries,
+        glossary_metadata_max_entries=args.glossary_metadata_max_entries,
+        metadata_facts_chunk_max_chars=args.metadata_facts_chunk_max_chars,
+        metadata_relations_chunk_max_chars=args.metadata_relations_chunk_max_chars,
+        metadata_scenes_chunk_max_chars=args.metadata_scenes_chunk_max_chars,
     )
+
+    translate_prompt_path = resolve_prompt_file(root, prompts_dir, args.translate_prompt)
+    cjk_retry_prompt_path = resolve_prompt_file(root, prompts_dir, args.cjk_retry_prompt)
 
     pipe = Pipeline(
         root=root,
@@ -1935,6 +2373,7 @@ def main() -> int:
         glossary_path=glossary_path,
         dry_run=args.dry_run,
         validate_enabled=not args.no_validate,
+        validate_retry_whole_chunk=args.validate_retry_whole_chunk,
         translate_header=not args.no_translate_header,
         timeline_enabled=args.timeline,
         timeline_path=(root / args.timeline_path).resolve() if args.timeline_path else (root / "timeline" / "timeline_events.jsonl"),
@@ -1945,6 +2384,10 @@ def main() -> int:
         relation_edges_path=(root / args.metadata_path_relation_edges).resolve(),
         scenes_enabled=args.scenes,
         scenes_path=(root / args.metadata_path_scenes).resolve(),
+        translate_prompt_path=translate_prompt_path,
+        translate_cjk_validate_enabled=args.translate_cjk_validate,
+        cjk_validate_retries=args.cjk_validate_retries,
+        cjk_retry_prompt_path=cjk_retry_prompt_path,
     )
 
     if args.chapter:

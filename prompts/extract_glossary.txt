@@ -15,7 +15,13 @@ Output requirements (STRICT):
 Legacy (do NOT use if you can output evidences): evidence + source_file as separate strings is deprecated.
 
 Rules:
-- Prefer English/Latin forms for Western fantasy names transliterated into Chinese (do NOT invent if unsure; still record the Chinese surface form).
+- **Foreign / Western proper names written as Chinese phonetic transliterations (音译):**
+  - Put every surface form in `names_zh` exactly as in the text.
+  - For `names_vi`, prefer **Latin-friendly Vietnamese** (phiên âm Quốc ngữ gần âm gốc, or well-known English spelling when obvious: e.g. Arthas, Azeroth).
+  - **Do NOT** default to **Sino-Vietnamese reading of each hanzi** (Hán Việt từng chữ) for these names — that makes Western characters sound like native Chinese names (wrong register).
+  - Example: short foreign-style personal name 古布 (Gu Bu): GOOD `names_vi` like "Gu Bu", "Gu Bố"; BAD as default for foreign register: "Cổ Bố" (pure Han-Viet of 古+布).
+  - Example: 阿尔萨斯 clearly as Arthas: use "Arthas" or a clear transliteration, not "Á Nhĩ Tát Tư" unless the project explicitly mandates full Han-Viet for all names.
+- **Truly Chinese-native names and places** (古典仙侠、纯中文名): Han-Viet or natural Vietnamese meaning is OK when the story is not Western-fantasy transliteration style.
 - Merge duplicates conceptually by reusing the same canonical_id when clearly the same entity.
 - Do NOT translate the story. ONLY glossary entries for entities present in the chunk.
 - Hard canonical_id rule (STRICT):

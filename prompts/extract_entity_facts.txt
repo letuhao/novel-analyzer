@@ -13,17 +13,28 @@ Each JSON line MUST be exactly:
 {
   "chapter_number": <int>,
   "entity_id": "<canonical_id>",
-  "facts": { <object with short keys> },
+  "facts": { <object with short keys — see bilingual rule below> },
   "evidences": [
-    { "source_file": "<filename>", "evidence_zh": "<short Chinese quote>" }
+    { "source_file": "<filename>", "evidence_zh": "<short Chinese quote>", "evidence_vi": "<Vietnamese translation of that quote>" }
   ]
 }
+
+Bilingual rule (STRICT — Vietnamese alongside Chinese):
+- In `facts`, use short ASCII keys for concepts (examples: role, goal, affiliation, current_state, current_situation, title).
+- For EVERY such key whose value is a Chinese (or mixed ZH) string, you MUST add a parallel key `<key>_vi` with the same meaning in natural Vietnamese (Quốc ngữ), same register as the main novel translation into Vietnamese.
+  - Example: "role": "魔王/王"  →  also "role_vi": "Ma vương / chúa tể" (or equivalent; follow glossary names_vi for entities).
+  - Example: "current_state": "想靜靜" → "current_state_vi": "muốn yên tĩnh" (natural VI, not character-by-character calque unless idiomatic).
+- Keys whose names already end with `_vi` hold Vietnamese only; do not nest another `_vi`.
+- If a fact value is already Latin/English only, you may omit `_vi` for that key or repeat the same string in `_vi`.
+
+Evidences:
+- `evidence_zh`: direct quote from the chunk, length <= 220 Chinese characters.
+- `evidence_vi`: REQUIRED — concise Vietnamese rendering of that quote (for RAG/snippets). Use glossary-consistent names.
 
 Hard rules:
 - entity_id MUST be taken ONLY from the provided glossary block (chapter_glossary_block).
 - Do NOT invent new canonical_id values.
 - facts should be concise (no full paragraphs), represent the entity’s current state/role/intent as implied by the chunk.
-- evidences must be direct quotes from the chunk, evidence_zh length <= 220 Chinese characters.
 - Prefer fewer, higher-confidence facts over many guesses.
 
 Glossary block (JSONL entries):
@@ -46,4 +57,3 @@ Chinese chunk to analyze:
 <start_of_chunk>
 {source_chunk}
 <end_of_chunk>
-

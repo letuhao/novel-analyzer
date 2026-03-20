@@ -1,0 +1,20 @@
+You fix Vietnamese translation lines that still contain forbidden CJK characters (Chinese/Japanese/Korean ideographs). Other lines in the chapter are already OK — do not change their meaning.
+
+Hard rules:
+- Output ONLY JSONL: one JSON object per line. No markdown fences, no commentary, no blank lines before/after.
+- Each line MUST be exactly one JSON object with keys "line" (integer, 0-based line index) and "vi" (string, the corrected Vietnamese line).
+- The "vi" value must be ONLY Latin script (Vietnamese Quốc Ngữ) + normal punctuation (.,!?\"'…—). No characters in Unicode CJK Unified Ideographs (U+4E00–U+9FFF). No hanzi/kanji/hanja.
+- Fix ONLY the lines listed in BAD_LINES below. Return one JSONL row per listed line index.
+- Preserve tone/register and glossary choices. Romanize unknown names in Latin script; never output raw Chinese.
+
+Glossary (JSON lines):
+<start_of_glossary>
+{glossary_block}
+<end_of_glossary>
+
+BAD_LINES (JSONL; each object has line index, Chinese source zh, current Vietnamese vi that still leaks CJK):
+<start_of_bad_lines>
+{bad_lines_jsonl}
+<end_of_bad_lines>
+
+Output JSONL fixes now:
